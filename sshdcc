@@ -1,0 +1,706 @@
+#!/bin/bash
+##
+## OpenSSHd Security Config Checker $sshdcc_version"
+##
+## Copyright 2018 SektionEins GmbH
+## 
+## Licensed under the Apache License, Version 2.0 (the "License");
+## you may not use this file except in compliance with the License.
+## You may obtain a copy of the License at
+## 
+## http://www.apache.org/licenses/LICENSE-2.0
+## 
+## Unless required by applicable law or agreed to in writing, software
+## distributed under the License is distributed on an "AS IS" BASIS,
+## WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+## See the License for the specific language governing permissions and
+## limitations under the License.
+##
+## useful links:
+## - download -> https://github.com/sektioneins/sshdcc"
+## - sshd_config manpage -> https://man.openbsd.org/sshd_config
+##
+##
+##
+
+# the following lines are Tcl comments \
+for i in tclsh8.6 tclsh; do \
+	if type $i >/dev/null; then exec $i "$0" "$@"; fi; \
+done; echo "Tcl not found. Please install Tcl 8.6 or newer"; exit 1
+
+
+if {[catch {package require Tcl 8.6} err]} { puts stderr $err; exit 1}
+package require cmdline
+package require fileutil
+package require textutil
+
+set sshdcc_version "0.1"
+set isatty [dict exists [fconfigure stdout] -mode]
+
+##
+
+## Only a subset of keywords may be used on the lines following a Match keyword. Available keywords are ...
+## (... copied from sshd_config manpage)
+set match_keywords {AcceptEnv, AllowAgentForwarding, AllowGroups, AllowStreamLocalForwarding, AllowTcpForwarding, AllowUsers,AuthenticationMethods, AuthorizedKeysCommand, AuthorizedKeysCommandUser, AuthorizedKeysFile,AuthorizedPrincipalsCommand, AuthorizedPrincipalsCommandUser, AuthorizedPrincipalsFile, Banner,ChrootDirectory, ClientAliveCountMax, ClientAliveInterval, DenyGroups, DenyUsers, ForceCommand,GatewayPorts, GSSAPIAuthentication, HostbasedAcceptedKeyTypes, HostbasedAuthentication,HostbasedUsesNameFromPacketOnly, IPQoS, KbdInteractiveAuthentication, KerberosAuthentication, LogLevel,MaxAuthTries, MaxSessions, PasswordAuthentication, PermitEmptyPasswords, PermitListen, PermitOpen,PermitRootLogin, PermitTTY, PermitTunnel, PermitUserRC, PubkeyAcceptedKeyTypes, PubkeyAuthentication,RekeyLimit, RevokedKeys, RDomain, SetEnv, StreamLocalBindMask, StreamLocalBindUnlink,TrustedUserCAKeys, X11DisplayOffset, X11Forwarding,  X11UseLocalHost}
+set match_keywords [lmap x [split $match_keywords {,}] {string trim $x}]
+
+## keywords allowed multiple times by design
+set multi_keywords {AcceptEnv HostCertificate HostKey ListenAddress Port Subsystem}
+
+## global default values to be loaded by -d or -dc cli options
+set defaults {}
+
+##
+
+## wrappers for lsearch
+proc in_list {list pattern args} {
+	return [expr {[lsearch {*}$args $list $pattern] >= 0}]
+}
+proc in_list_any {list patternlist args} {
+	foreach pattern patternlist {
+		if {[lsearch {*}$args $list $pattern] >= 0} {
+			return 1
+		}
+	}
+}
+
+## read file or exit
+proc read_file {fn} {
+	if {![file readable $fn]} {
+		puts stderr "file $fn does not exist or is not readable"
+		exit 1
+	}
+	return [::fileutil::cat $fn]
+}
+
+## read data from command or exit
+proc read_cmd {cmd} {
+	try {
+		set f [open "|$cmd"]
+	}
+	set data [read $f]
+	catch {close $f}
+	return $data
+}
+
+## read file and parse config
+proc load_config {fn} {
+	return [parse_config [read_file $fn]]
+}
+
+## parse config from data and return a list of dicts for each relevant line
+proc parse_config {data} {
+	# global defaults
+	set result {}
+	set ::check_errors 0
+	set lines [split $data "\n"]
+	set lineno 0
+	foreach line $lines {
+		incr lineno
+		set line [string trim $line]
+
+		## empty lines and comments
+		if {$line eq ""} { continue }
+		if {[regexp -- {^#} $line]} { continue }
+
+		if {![regexp -- {^(.*?)\s+(.*)$} $line -> key value]} {
+			puts stderr "WARNING: unknown syntax on line $lineno: $line"
+			set ::check_errors 1
+			continue
+		}
+
+		lappend result [list key $key value $value line $line lineno $lineno]
+	}
+	return $result
+}
+
+## split by word
+proc wsplit {str} {
+	return [regexp -inline -all -- {[^\s]+} $str]
+}
+
+## add to result list - internal function to be used within check_file
+proc addresult {severity msg desc} {
+	upvar lineno lineno
+	upvar result result
+	upvar line line key key value value
+	lappend result [list severity $severity msg $msg desc $desc key $key value $value line $line lineno $lineno]
+}
+
+## parse /etc/group or /etc/passwd and return list of groups/usernames
+proc get_groups {fn} {
+	return [lmap u [regexp -all -inline -line -- {^.*?:} [fileutil::cat $fn]] {
+		string trimright $u {:}
+	}]
+}
+
+## perform security check on file
+proc check_file {fn} {
+	set result {}
+	set ::check_errors 0
+	set section "global"
+
+	set cfgdata [load_config $fn]
+
+	## merge with defaults
+	set cfgkeys [lmap entry $cfgdata {dict get $entry key}]
+	foreach entry $::defaults {
+		set key [dict get $entry key]
+		if {[in_list $cfgkeys $key -exact -nocase]} { continue }
+		dict set entry lineno 0
+		set cfgdata [linsert $cfgdata 0 $entry]
+	}
+
+	## the cfg array will collect the entire configuration for extra tests
+	array set cfg {global {}}
+
+	foreach entry $cfgdata {
+		## set variables from dict: key, value, line, lineno
+		foreach {k v} $entry { set $k $v }
+
+		switch -nocase -- $key {
+			AcceptEnv {
+				set bad_vars {"LD_LIBRARY_PATH" "DYLD_LIBRARY_PATH" "PATH"}
+				foreach env_pattern [wsplit $value] {
+					if {[in_list $bad_vars $env_pattern -glob]} {
+						addresult critical "dangerous environment variable accepted by pattern: $env_pattern" {From the manual: "Be warned that some environment variables could be used to bypass restricted user environments. For this reason, care should be taken in the use of this directive."}
+					} else {
+						addresult notice "extra environment variable accepted by pattern: $env_pattern" {The default is not to accept any environment variables. Please make sure, that this variable pattern is actually required.}
+					}
+				}
+			}
+
+			AllowGroups -
+			DenyGroups -
+			AllowUsers -
+			DenyUsers {
+				if {!$::params(ns)} {
+					switch -nocase -glob -- $key {
+						*Groups {
+							set groupfile "/etc/group"
+							set groupname "group"
+						}
+						*Users {
+							set groupfile "/etc/passwd"
+							set groupname "user"
+						}
+					}
+					set patterns [regexp -all -inline -nocase -- {[^,\s]+} $value]
+					set all [get_groups $groupfile]
+					foreach pattern $patterns {
+						if {![in_list $all $pattern -glob]} {
+							addresult notice "$groupname pattern does not match any $groupname found in $groupfile: $pattern" {This may or may not be a mistake.}
+						}
+					}
+				}
+			}
+
+			AuthenticationMethods {
+				set authlists [lmap x [wsplit $value] {split $x {,}}]
+				if {[in_list $authlists {any} -exact]} {
+					addresult warning "login via any authentication method is allowed" {It is usually a good idea to restrict authentication methods to those actually required, e.g. 'publickey'. Please change this setting.}
+				} elseif {[in_list_any $authlists {{keyboard-interactive} {password}} -exact]} {
+					addresult notice "login via password is allowed" {Public key based authentication methods are considered much more secure. Unless your configuration contains some kind of one-time-password, e.g. via PAM, this setting should include 'publickey'.}
+				}
+				if {[in_list $authlists {none} -exact]} {
+					addresult notice "passwordless authentication is enabled" {Anonymous access is rarely needed. Please recheck this setting manually.}
+				}
+			}
+
+			AuthorizedKeysCommand -
+			AuthorizedPrincipalsCommand {
+				if {$value ne "" && $value ne "none"} {
+					addresult info "$key is set to $value" {FYI.}
+				}
+				if {$value ne "" && $value ne "none" && !$::params(ns)} {
+					if {![file exists $value]} {
+						addresult notice "$key does not exist" {This will never work.}
+					} elseif {![file executable $value]} {
+						addresult notice "$key is not executable" {This will never work.}
+					} else {
+						file stat $value stat
+						if {[expr {$stat(mode) & 0022}]} {
+							addresult warning "$key is writable by group or others" {Please change file permissions immediately.}
+						}
+
+						set path_components [file split $value]
+						for {set i 0} {$i < [llength $path_components]-1} {incr i} {
+							set dir [file join {*}[lrange $path_components 0 $i]]
+							file stat $dir stat
+							if {[expr {$stat(mode) & 0022}]} {
+								addresult warning "parent directory is writable by group or others: $dir" {Please change file permissions if necessary.}
+							}
+						}
+					}
+				}
+			}
+
+			AuthorizedKeysCommandUser -
+			AuthorizedPrincipalsCommandUser {
+				if {$value eq "root"} {
+					addresult warning "authorized keys command user is root" {Executing this command as root is most likely not necessary. Please change this user to an unpriviliged user account dedicated to the authorized keys command.}
+				}
+			}
+
+			Ciphers {
+				if {$lineno == 0} {
+					## default value
+					addresult notice "using default cipher list" {Depending on the version, SSH's default cipher list may contain really old ciphers, likely for compatibility with older versions. Try 'ssh -Q cipher' and choose current and secure ciphers as suitable.}
+				}
+			}
+
+			GatewayPorts {
+				if {$value eq "yes"} {
+					addresult notice "$key is set to $value" {This is usually a bad idea, unless you know what you are doing. Please consider setting this option at least to 'clientspecified' or better yet to 'no'.}
+				} elseif {$value eq "clientspecified"} {
+					addresult info "$key is net to $value" {Be aware that remote hosts may connect to local ports via port forwarding.}
+				}
+			}
+
+			GSSAPICleanupCredentials -
+			KerberosTicketCleanup {
+				if {$value eq "no"} {
+					addresult notice "credentials are stored past logout" {Unless there is a specific reason for retaining these credentials, please turn this setting to 'yes'.}
+				}
+			}
+
+			KexAlgorithms {
+				if {$lineno == 0} {
+					addresult info "using default list of key exchange algorithms" {The default may be perfectly fine for you. Otherwise, please check 'ssh -Q kex' for a list of available algorithms.}
+				}
+			}
+
+			HostbasedAcceptedKeyTypes -
+			HostKeyAlgorithms -
+			PubkeyAcceptedKeyTypes {
+				if {$lineno == 0} {
+					addresult info "using default list of algorithms" {The default is most likely suitable. Otherwise, please check 'ssh -Q key' for a list of available algorithms.}
+				}
+			}
+
+			HostbasedAuthentication {
+				if {$value eq "yes"} {
+					addresult info "host based authentication is enabled" {This authentication method should only be used in trusted environments with similar access levels, e.g. a university ZIP pool or hosts of a cluster computing group.}
+				}
+			}
+
+			HostbasedUsesNameFromPacketOnly {
+				if {$value eq "yes"} {
+					addresult notice "host based hostname spoofing may be possible" {This option should only be set if IP to name resolution is not possible for some reason.}
+				}
+			}
+
+			LoginGraceTime {
+				if {[string is integer $value] && ($value > 120 || $value == 0)} {
+					addresult warning "login timeout is set rather high: $value" {Not dropping the unauthenticated connection after a short while enables Denial-of-Service attacks.}
+				}
+			}
+
+			LogLevel {
+				switch -glob -- $value {
+					QUIET -
+					FATAL -
+					ERROR {
+						addresult info "$key is set to $value" {Silent log levels are ok for production, but they might make debugging just a bit harder in case of problems. The default would be INFO.}
+					}
+					INFO -
+					VERBOSE {}
+					DEBUG* {
+						addresult warning "$key is set to $value" {The manpage states: "Logging with a DEBUG level violates the privacy of users and is not recommended."}
+					}
+					default {
+						addresult info "unknown log level: $value" {This log level may be invalid.}
+					}
+				}
+			}
+
+			MACs {
+				if {$lineno == 0} {
+					addresult info "using default list of MAC algorithms" {This is most likely ok. Check out 'ssh -Q mac' for a list of available algorithms to choose from.}
+				}
+			}
+
+			Match {
+				set section "match_$lineno"
+			}
+
+			MaxAuthTries {
+				if {[string is integer $value] && $value > 20} {
+					addresult notice "$key is rather high" {A lot of auth retries make login bruteforcing easier and may lead to Denial-of-Service attacks.}
+				}
+			}
+			
+			MaxSessions {
+				if {[string is integer $value] && $value > 50} {
+					addresult notice "$key is set to $value" {A high number of concurrent sessions may lead to ressource exhaustion and thus to DoS.}
+				}
+			}
+
+			PasswordAuthentication {
+				if {$value eq "yes"} {
+					addresult notice "login via password is allowed" {Public key based authentication methods are considered much more secure. Unless your configuration contains some kind of one-time-password, e.g. via PAM, this setting should be changed to 'no'.}
+				}
+			}
+
+			PermitEmptyPasswords {
+				if {$section eq "global" && $value eq "yes"} {
+					addresult warning "empty passwords are allowed globally" {Please use Match blocks to allow password-less logins for specific accounts only rather than globally.}
+				}
+			}
+
+			PermitRootLogin {
+				if {$value eq "yes"} {
+					addresult warning "root login with password is enabled" {Why?}
+				}
+			}
+
+			PubkeyAuthentication {
+				if {$section eq "global" && $value eq "no"} {
+					addresult notice "public key authentication is disabled globally" {Why?}
+				}
+			}
+
+			StrictModes {
+				if {$value eq "no"} {
+					addresult warning "ssh does not check file modes" {The manual states: "This is normally desirable because novices sometimes accidentally leave their directory or files world-writable."}
+				}
+			}
+
+			VersionAddendum {
+				if {$value ne "none"} {
+					addresult notice "You have a version addendum: $value" {Nice.}
+				}
+			}
+
+			X11UseLocalhost {
+				if {$value eq "no"} {
+					addresult notice "X11 is bound to the wildcard address" {This is usually not desired without additional access restrictions.}
+				}
+			}
+
+			AddressFamily -
+			AllowAgentForwarding -
+			AllowStreamLocalForwarding -
+			AllowTcpForwarding -
+			AuthorizedKeysFile -
+			AuthorizedPrincipalsFile -
+			Banner -
+			ChallengeResponseAuthentication -
+			ChrootDirectory -
+			ClientAliveCountMax -
+			ClientAliveInterval -
+			Compression -
+			DisableForwarding -
+			ExposeAuthInfo -
+			FingerprintHash -
+			ForceCommand -
+			GSSAPIAuthentication -
+			GSSAPIStrictAcceptorCheck -
+			HostCertificate -
+			HostKey -
+			HostKeyAgent -
+			IgnoreRhosts -
+			IgnoreUserKnownHosts -
+			IPQoS -
+			KbdInteractiveAuthentication -
+			KerberosAuthentication -
+			KerberosGetAFSToken -
+			KerberosOrLocalPasswd -
+			ListenAddress -
+			MaxStartups -
+			PermitListen -
+			PermitOpen -
+			PermitTTY -
+			PermitTunnel -
+			PermitUserEnvironment -
+			PermitUserRC -
+			PidFile -
+			Port -
+			PrintLastLog -
+			PrintMotd -
+			RekeyLimit -
+			RevokedKeys -
+			RDomain -
+			SetEnv -
+			StreamLocalBindMask -
+			StreamLocalBindUnlink -
+			Subsystem -
+			SyslogFacility -
+			TCPKeepAlive -
+			TrustedUserCAKeys -
+			UseDNS -
+			UsePAM -
+			X11DisplayOffset -
+			X11Forwarding -
+			XAuthLocation {
+				## nothing to see here.
+			}
+
+			default {
+				addresult warning "unknown option '$key'" "Unknown options can be a typo in the configuration or it may be an unsupported feature of a new or custom SSH version"
+			}
+		}
+
+		## collect configuration
+		set hkey [string tolower $key]
+
+		if {[in_list $::multi_keywords $key -exact -nocase]} {
+			dict lappend cfg($section) $key $value
+		} else {
+			if {[info exists cfg($section)] && [dict exists $cfg($section) $hkey]} {
+				addresult warning "multiple occurrences of '$key'" {This setting overwrites a previous setting.}
+			}
+			dict set cfg($section) $hkey $value
+		}
+
+
+		## extra per-line checks
+		if {$section ne "global"} {
+			## we are in a Match section
+			if {$hkey ne "match" && ![in_list $::match_keywords $key -exact -nocase]} {
+				addresult warning "option is not allowed within a Match section" {This will not work.}
+			}
+		}
+	}
+
+	## extra checks
+
+	## Match sections (or the global section) with restrictions, e.g. SFTP and ForceCommand
+	## This test assumes distinct match blocks containing all relevant options.
+	## Configurations with multiple combined match blocks will likely produce false positives here.
+	foreach {section entries} [array get cfg] {
+		## set $line and $lineno for result output
+		if {[regexp -- {^match_(\d+)$} $section -> lineno]} {
+			foreach entry $cfgdata {
+				if {[dict get $entry lineno] == $lineno} {
+					set line [dict get $entry line]
+					break
+				}
+			}
+		} else {
+			set lineno 1
+			set line "(global section)"
+		}
+
+		## ForceCommand set? -> restricted block.
+		set forcecommand ""
+		if {[dict exists $entries forcecommand]} {
+			set forcecommand [dict get $entries forcecommand]
+		}
+		if {$forcecommand ne "" && $forcecommand ne "none"} {
+			## check for chroot in SFTP environment
+			set chrootdirectory "none"
+			if {[dict exists $entries chrootdirectory]} { set chrootdirectory [dict get $entries chrootdirectory] }
+
+			set note_false_positive {Note: This test only checks for restrictions within each Match block, not applying several blocks at once, so this issue may be a false positive.}
+			if {[string match -nocase "*sftp*" $forcecommand] && $chrootdirectory eq "none"} {
+				addresult warning "SFTP without chroot" "Using chroot as additional safeguard for SFTP servers is highly recommended. $note_false_positive"
+			}
+
+			## check for common restrictions
+			set restricting_keywords {AllowAgentForwarding AllowStreamLocalForwarding AllowTcpForwarding PermitTTY PermitTunnel PermitUserEnvironment PermitUserRC X11Forwarding}
+			set restrictcheck_results {}
+			foreach seckey $restricting_keywords {
+				set hseckey [string tolower $seckey]
+				## looking for value to current keyword...
+				if {[dict exists $entries $hseckey]} {
+					## get value from Match block
+					set secvalue [dict get $entries $hseckey]
+				} elseif {$section ne "global" && [info exists cfg($section)] && [dict exists $cfg($section) $hseckey]} {
+					## get value from global section or default
+					set secvalue [dict get $cfg($section) $hseckey]
+				} else {
+					## assume the insecure value
+					set secvalue yes
+				}
+				if {$secvalue eq "yes"} {
+					lappend restrictcheck_results $seckey
+				}
+			}
+			if {$restrictcheck_results ne {}} {
+				addresult warning "restricted block with insufficient restrictions" "The following settings were found to be enabled within a restricted environment: [join $restrictcheck_results ", "]. $note_false_positive Also, restrictions may be set using authorized_keys options, e.g. by putting 'restrict' in front of all relevant keys."
+			}
+		}
+	}
+
+	if {!$::params(ns)} {
+		## check /etc/ssh/sshd_config owner/permissions
+		file stat $::params(f) stat
+		if {[expr {$stat(mode) & 0022}]} {
+			addresult warning "$::params(f) is writable by group or others" {Please change file permissions immediately.}
+		}
+	}
+
+
+	return $result
+}
+
+## restrict line length for easier readability and email-compatible copy/paste
+proc putx {str {indent 0}} {
+	set width 79
+	set str [::textutil::adjust $str -justify left -length [expr {$width - $indent}]]
+	if {$indent} {
+		set str [::textutil::indent $str [string repeat " " $indent]]
+	}
+	puts $str
+}
+
+## return current date and time
+proc timestamp {} {
+	return [clock format [clock seconds] -format "%Y-%m-%d %H:%M:%S"]
+}
+
+## CLI
+
+puts "------------------------------------------------------------------------------"
+puts "This is OpenSSHd Security Config Checker $sshdcc_version"
+puts "  - (c) 2018 SektionEins GmbH / Ben Fuhrmannek - https://sektioneins.de/"
+puts "  - download -> https://github.com/sektioneins/sshdcc"
+puts "running on $tcl_platform(os) $tcl_platform(osVersion) $tcl_platform(machine) with Tcl $tcl_version [expr {$isatty ? "with" : "without"}] TTY"
+puts "started at [timestamp]"
+puts "------------------------------------------------------------------------------"
+
+set options {
+	{f.arg "/etc/ssh/sshd_config" "scan file"}
+	{ns "do not check this system's live configuration (disables additional checks)"}
+	{d.arg "" "load SSH default config valuas from file"}
+	{dc.arg "" "load SSH default config from command, e.g. 'sudo sshd -f /dev/null -T'"}
+	{csv.arg "" "save results to CSV file"}
+	{noout "do not print results"}
+	{nc "no color output on tty"}
+}
+
+set usage ": $argv0 \[options]\noptions:"
+try {
+	array set params [::cmdline::getoptions argv $options $usage]
+} on error {result} {
+	puts $result
+	puts "## EXAMPLES"
+	puts "\nCheck current system:"
+	puts "  HERE->$ $argv0 -dc 'sudo sshd -f /dev/null -T'"
+	puts "\nCheck configuration copied from other system:"
+	puts "  REMOTE$ sudo sshd -f /dev/null -T >defaults.conf"
+	puts "  ... now copy sshd_config and defaults.conf to some other machine ..."
+	puts "  OTHER-$ $argv0 -f sshd_config -d defaults.conf -ns"
+	exit 1
+}
+
+## init color
+if {!$params(nc) && $isatty} {
+	package require term::ansi::code
+	package require term::ansi::code::ctrl
+
+}
+proc c {name} {
+	if {$::params(nc)} { return "" }
+	switch -exact $name {
+		critical { set name "magenta" }
+		warning { set name "red" }
+		notice { set name "yellow" }
+		info { set name "green" }
+	}
+	# return "{$name}"
+	foreach prefix {"::term::ansi::code::ctrl::sda_fg" "::term::ansi::code::ctrl::sda_" "::term::ansi::code::ctrl::"} {
+		set cmd "$prefix$name"
+		if {[info commands $cmd] ne ""} { return [$cmd] }
+	}
+	# return "{none}"
+	return ""
+}
+
+## CSV checks
+if {$params(csv) ne ""} {
+	package require csv
+
+	if {[file exists $params(csv)]} {
+		puts stderr "CSV file '$params(csv)' already exists."
+		exit 1
+	}
+	if {![file writable [file dirname $params(csv)]]} {
+		puts stderr "Directory not writable: $params(csv)"
+		exit 1
+	}
+}
+
+## info
+
+puts "additional live system checks are [expr {$params(ns) ? {disabled} : {enabled}}]"
+if {$params(csv) ne ""} {
+	puts "writing results to $params(csv)"
+}
+
+## defaults
+
+if {$params(d) ne ""} {
+	puts "loading defaults from $params(d)"
+	set defaults [load_config $params(d)]
+} elseif {$params(dc) ne ""} {
+	puts "loading defaults from command $params(dc)"
+	set defaults [parse_config [read_cmd $params(dc)]]
+} else {
+	putx "NOTE: No defaults were loaded. For better results, please specify either -d or -dc. See -h for more help."
+}
+
+## SCAN
+
+puts "scanning file $params(f)"
+set result [check_file $params(f)]
+
+## OUTPUT
+
+if {$check_errors} {
+	putx "NOTE: There were errors during processing. Please check your configuration file for syntax errors."
+}
+# putx "[c yellow]test[c default]"
+
+if {!$params(noout)} {
+	puts "\n## RESULTS ##\n"
+	if {[llength $result] == 0} {
+		putx "There are no findings regarding your configuration file, not even comments. This is highly unusual."
+		exit 0
+	}
+
+	set resultno 0
+	foreach severity {critical warning notice info} {
+		foreach entry [lsearch -all -inline -index 1 -exact $result $severity] {
+			foreach k {msg desc key value line lineno} {
+				set $k [dict get $entry $k]
+			}
+			# 
+			incr resultno
+			puts "[c bold]($resultno)[c reset] \[[c $severity][string toupper $severity][c default]\] [c bold]$msg[c reset]"
+			if {$lineno > 0} {
+				putx "[c italic]#> LINE $lineno: $line[c reset]" 4
+			} else {
+				putx "[c italic]#> SYSTEM DEFAULT: $line[c reset]" 4
+			}
+			putx $desc 4
+			puts ""
+
+			if {$params(csv) ne ""} {
+			}
+		}
+	}
+}
+
+## CSV output
+if {$params(csv) ne ""} {
+	set csv [open $params(csv) wb]
+	set csv_keys {resultno msg desc key value lineno line}
+	set csv_header {"No." "Short description" "Description" "Option" "Value" "Line no." "Line"}
+	puts $csv [csv::join $csv_header]
+
+	set resultno 0
+	foreach severity {critical warning notice info} {
+		foreach entry [lsearch -all -inline -index 1 -exact $result $severity] {
+			foreach k {msg desc key value line lineno} {
+				set $k [dict get $entry $k]
+			}
+			incr resultno
+			puts $csv [csv::join [lmap k $csv_keys {set $k}]]
+		}
+	}
+	close $csv
+}
+
+puts "done."

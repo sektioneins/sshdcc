@@ -134,6 +134,26 @@ proc get_groups {fn} {
 	}]
 }
 
+## map alias options to their counterpart by changing the 'key'
+proc map_aliases {cfgdata} {
+	set result {}
+	foreach entry $cfgdata {
+		set key [dict get $entry key]
+		switch -nocase -- $key {
+			authorizedkeysfile2 { set key "AuthorizedKeysFile" }
+			hostdsakey { set key "HostKeyFile" }
+			dsaauthentication { set key "PubkeyAuthentication" }
+			skeyauthentication { set key "ChallengeResponseAuthentication" }
+			keepalive { set key "TCPKeepAlive" }
+			verifyreversemapping -
+			reversemappingcheck { set key "UseDNS" }
+		}
+		dict set entry key $key
+		lappend result $entry
+	}
+	return $result
+}
+
 ## perform security check on file
 proc check_file {fn} {
 	set result {}
@@ -141,10 +161,12 @@ proc check_file {fn} {
 	set section "global"
 
 	set cfgdata [load_config $fn]
+	set cfgdata [map_aliases $cfgdata]
 
 	## merge with defaults
+	set defaults [map_aliases $::defaults]
 	set cfgkeys [lmap entry $cfgdata {dict get $entry key}]
-	foreach entry $::defaults {
+	foreach entry $defaults {
 		set key [dict get $entry key]
 		if {[in_list $cfgkeys $key -exact -nocase]} { continue }
 		dict set entry lineno 0
@@ -242,6 +264,10 @@ proc check_file {fn} {
 				}
 			}
 
+			CheckMail {
+				addresult critical "old SSH version" "$key has been deprecated a very long time. Please upgrade your SSH installation."
+			}
+
 			Ciphers {
 				if {$lineno == 0} {
 					## default value
@@ -249,6 +275,11 @@ proc check_file {fn} {
 				}
 			}
 
+			DebianBanner {
+				if {$value eq "yes"} {
+					addresult notice "information disclosure / extra version" {With the principle of least privilege in mind, it is a good idea to divulge as little information as possible. Please set this to 'no'.}
+				}
+			}
 			GatewayPorts {
 				if {$value eq "yes"} {
 					addresult notice "$key is set to $value" {This is usually a bad idea, unless you know what you are doing. Please consider setting this option at least to 'clientspecified' or better yet to 'no'.}
@@ -267,6 +298,12 @@ proc check_file {fn} {
 			KexAlgorithms {
 				if {$lineno == 0} {
 					addresult info "using default list of key exchange algorithms" {The default may be perfectly fine for you. Otherwise, please check 'ssh -Q kex' for a list of available algorithms.}
+				}
+			}
+
+			KeyRegenerationInterval {
+				if {[string is integer $value] && $value > 3600} {
+					addresult warning "protocol 1 ephemeral server key regeneration disabled or very long" {This key may be used to decrypt stored sessions. Please do not use protocol 1 in the first place, but if you do anyway, please set this value to at most 3600 (1 hour).}
 				}
 			}
 
@@ -360,9 +397,30 @@ proc check_file {fn} {
 				}
 			}
 
+			Protocol {
+				set protocols [split $value {,}]
+				if {[in_list $protocols "1"]} {
+					addresult warning "protocol 1 enabled" {From the manual: "Protocol 1 suffers from a number of cryptographic weaknesses and should not be used.  It is only offered to support legacy devices."}
+				}
+			}
+
+			ServerKeyBits {
+				if {[string is integer $value] && $value < 2048} {
+					addresult warning "protocol 1 server key is rather weak" {Anything below 2048 bits is considered weak. Please don't use protocol 1 anymore, but if you absolutely have to, then set this value to at least 2048, please.}
+				}
+			}
+
 			StrictModes {
 				if {$value eq "no"} {
 					addresult warning "ssh does not check file modes" {The manual states: "This is normally desirable because novices sometimes accidentally leave their directory or files world-writable."}
+				}
+			}
+
+			UsePrivilegeSeparation {
+				if {$value eq "no"} {
+					addresult critical "sandboxing and privilege separation disabled" {Privilege separation and sandboxing has been the default for years. This protection must remain enabled!}
+				} elseif {$value ne "sandbox"} {
+					addresult warning "sandboxing disabled" {Sandboxing has been the default for years. This options should be set to 'sandbox'.}
 				}
 			}
 
@@ -395,7 +453,9 @@ proc check_file {fn} {
 			FingerprintHash -
 			ForceCommand -
 			GSSAPIAuthentication -
+			GSSAPIKeyExchange -
 			GSSAPIStrictAcceptorCheck -
+			GSSAPIStoreCredentialsOnRekey -
 			HostCertificate -
 			HostKey -
 			HostKeyAgent -
@@ -421,6 +481,8 @@ proc check_file {fn} {
 			RekeyLimit -
 			RevokedKeys -
 			RDomain -
+			RhostsRSAAuthentication -
+			RSAAuthentication -
 			SetEnv -
 			StreamLocalBindMask -
 			StreamLocalBindUnlink -
@@ -429,6 +491,7 @@ proc check_file {fn} {
 			TCPKeepAlive -
 			TrustedUserCAKeys -
 			UseDNS -
+			UseLogin -
 			UsePAM -
 			X11DisplayOffset -
 			X11Forwarding -

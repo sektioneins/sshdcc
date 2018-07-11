@@ -47,7 +47,7 @@ done.
 Check current system, using ssh defaults as reference. Defaults vary for different SSH versions, so they are not included in the tool. The command 'sshd -f /dev/null -T' prints out the running version's default configuration.
 
 ```
-./sshdcc -dc 'sudo sshd -f /dev/null -T'
+./sshdcc -dc0
 ------------------------------------------------------------------------------
 This is OpenSSHd Security Config Checker 0.1
   - (c) 2018 SektionEins GmbH / Ben Fuhrmannek - https://sektioneins.de/

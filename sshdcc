@@ -627,7 +627,8 @@ set options {
 	{f.arg "/etc/ssh/sshd_config" "scan file"}
 	{ns "do not check this system's live configuration (disables additional checks)"}
 	{d.arg "" "load SSH default config valuas from file"}
-	{dc.arg "" "load SSH default config from command, e.g. 'sudo sshd -f /dev/null -T'"}
+	{dc.arg "" "load SSH default config from command"}
+	{dc0 "load SSH default config from command 'sudo sshd -f /dev/null -T'"}
 	{csv.arg "" "save results to CSV file"}
 	{noout "do not print results"}
 	{nc "no color output on tty"}
@@ -694,11 +695,14 @@ if {$params(csv) ne ""} {
 
 ## defaults
 
+if {$params(dc0)} {
+	set params(dc) {sudo sshd -f /dev/null -T}
+}
 if {$params(d) ne ""} {
 	puts "loading defaults from $params(d)"
 	set defaults [load_config $params(d)]
 } elseif {$params(dc) ne ""} {
-	puts "loading defaults from command $params(dc)"
+	puts "loading defaults from command '$params(dc)'"
 	set defaults [parse_config [read_cmd $params(dc)]]
 } else {
 	putx "NOTE: No defaults were loaded. For better results, please specify either -d or -dc. See -h for more help."

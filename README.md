@@ -8,8 +8,9 @@ SSHDCC can check your OpenSSH server configuration file for security improvement
 Requirements
 ------------
 
-* OpenSSH server configuration
+* OpenSSH server configuration file
 * Tcl version 8.6 (or later)
+* tcllib
 
 Example usage
 -------------
@@ -130,6 +131,6 @@ remote$ sudo sshd -f /dev/null -T >defaults.conf
 remote$ exit
 $ scp remote:defaults.conf .
 ...
-$ scp /etc/ssh/sshd_config .
+$ scp remote:/etc/ssh/sshd_config .
 $ ./sshdcc -f sshd_config -d defaults.conf -ns -csv results.csv
 ```

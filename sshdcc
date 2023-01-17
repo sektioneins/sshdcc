@@ -34,18 +34,18 @@ package require cmdline
 package require fileutil
 package require textutil
 
-set sshdcc_version "0.1"
+set sshdcc_version "0.2"
 set isatty [dict exists [fconfigure stdout] -mode]
 
 ##
 
 ## Only a subset of keywords may be used on the lines following a Match keyword. Available keywords are ...
 ## (... copied from sshd_config manpage)
-set match_keywords {AcceptEnv, AllowAgentForwarding, AllowGroups, AllowStreamLocalForwarding, AllowTcpForwarding, AllowUsers,AuthenticationMethods, AuthorizedKeysCommand, AuthorizedKeysCommandUser, AuthorizedKeysFile,AuthorizedPrincipalsCommand, AuthorizedPrincipalsCommandUser, AuthorizedPrincipalsFile, Banner,ChrootDirectory, ClientAliveCountMax, ClientAliveInterval, DenyGroups, DenyUsers, ForceCommand,GatewayPorts, GSSAPIAuthentication, HostbasedAcceptedKeyTypes, HostbasedAuthentication,HostbasedUsesNameFromPacketOnly, IPQoS, KbdInteractiveAuthentication, KerberosAuthentication, LogLevel,MaxAuthTries, MaxSessions, PasswordAuthentication, PermitEmptyPasswords, PermitListen, PermitOpen,PermitRootLogin, PermitTTY, PermitTunnel, PermitUserRC, PubkeyAcceptedKeyTypes, PubkeyAuthentication,RekeyLimit, RevokedKeys, RDomain, SetEnv, StreamLocalBindMask, StreamLocalBindUnlink,TrustedUserCAKeys, X11DisplayOffset, X11Forwarding,  X11UseLocalHost}
+set match_keywords {AcceptEnv, AllowAgentForwarding, AllowGroups, AllowStreamLocalForwarding, AllowTcpForwarding, AllowUsers, AuthenticationMethods, AuthorizedKeysCommand, AuthorizedKeysCommandUser, AuthorizedKeysFile, AuthorizedPrincipalsCommand, AuthorizedPrincipalsCommandUser, AuthorizedPrincipalsFile, Banner, CASignatureAlgorithms, ChrootDirectory, ClientAliveCountMax, ClientAliveInterval, DenyGroups, DenyUsers, DisableForwarding, ExposeAuthInfo, ForceCommand, GatewayPorts, GSSAPIAuthentication, HostbasedAcceptedAlgorithms, HostbasedAuthentication, HostbasedUsesNameFromPacketOnly, IgnoreRhosts, Include, IPQoS, KbdInteractiveAuthentication, KerberosAuthentication, LogLevel, MaxAuthTries, MaxSessions, PasswordAuthentication, PermitEmptyPasswords, PermitListen, PermitOpen, PermitRootLogin, PermitTTY, PermitTunnel, PermitUserRC, PubkeyAcceptedAlgorithms, PubkeyAuthentication, PubkeyAuthOptions, RekeyLimit, RevokedKeys, RDomain, SetEnv, StreamLocalBindMask, StreamLocalBindUnlink, TrustedUserCAKeys, X11DisplayOffset, X11Forwarding, X11UseLocalhost}
 set match_keywords [lmap x [split $match_keywords {,}] {string trim $x}]
 
 ## keywords allowed multiple times by design
-set multi_keywords {AcceptEnv HostCertificate HostKey ListenAddress Port Subsystem}
+set multi_keywords {AcceptEnv HostCertificate HostKey ListenAddress PermitListen PermitOpen Port Subsystem}
 
 ## global default values to be loaded by -d or -dc cli options
 set defaults {}
@@ -85,14 +85,14 @@ proc read_cmd {cmd} {
 
 ## read file and parse config
 proc load_config {fn} {
-	return [parse_config [read_file $fn]]
+	return [parse_config [read_file $fn] $fn]
 }
 
 ## parse config from data and return a list of dicts for each relevant line
-proc parse_config {data} {
+proc parse_config {data {cfgfn ""}} {
 	# global defaults
 	set result {}
-	set ::check_errors 0
+	# set ::check_errors 0
 	set lines [split $data "\n"]
 	set lineno 0
 	foreach line $lines {
@@ -109,7 +109,16 @@ proc parse_config {data} {
 			continue
 		}
 
-		lappend result [list key $key value $value line $line lineno $lineno]
+		if {!$::params(ni) && [string equal -nocase $key "Include"]} {
+			foreach globpattern [::textutil::splitx $value] {
+				foreach inc_fn [lsort [glob -type f -- $globpattern]] {
+					lappend result {*}[load_config $inc_fn]
+				}
+			}
+			continue
+		}
+
+		lappend result [list key $key value $value line $line lineno $lineno cfgfn $cfgfn]
 	}
 	return $result
 }
@@ -265,7 +274,7 @@ proc check_file {fn} {
 			}
 
 			CheckMail {
-				addresult critical "old SSH version" "$key has been deprecated a very long time. Please upgrade your SSH installation."
+				addresult critical "old SSH version" "$key has been deprecated for a very long time. Please upgrade your SSH installation."
 			}
 
 			Ciphers {
@@ -280,6 +289,7 @@ proc check_file {fn} {
 					addresult notice "information disclosure / extra version" {With the principle of least privilege in mind, it is a good idea to divulge as little information as possible. Please set this to 'no'.}
 				}
 			}
+
 			GatewayPorts {
 				if {$value eq "yes"} {
 					addresult notice "$key is set to $value" {This is usually a bad idea, unless you know what you are doing. Please consider setting this option at least to 'clientspecified' or better yet to 'no'.}
@@ -617,7 +627,7 @@ proc timestamp {} {
 
 puts "------------------------------------------------------------------------------"
 puts "This is OpenSSHd Security Config Checker $sshdcc_version"
-puts "  - (c) 2018 SektionEins GmbH / Ben Fuhrmannek - https://sektioneins.de/"
+puts "  - (c) 2018-2023 SektionEins GmbH / Ben Fuhrmannek - https://sektioneins.de/"
 puts "  - download -> https://github.com/sektioneins/sshdcc"
 puts "running on $tcl_platform(os) $tcl_platform(osVersion) $tcl_platform(machine) with Tcl $tcl_version [expr {$isatty ? "with" : "without"}] TTY"
 puts "started at [timestamp]"
@@ -626,6 +636,7 @@ puts "--------------------------------------------------------------------------
 set options {
 	{f.arg "/etc/ssh/sshd_config" "scan file"}
 	{ns "do not check this system's live configuration (disables additional checks)"}
+	{ni "do not resolve Include directives"}
 	{d.arg "" "load SSH default config valuas from file"}
 	{dc.arg "" "load SSH default config from command"}
 	{dc0 "load SSH default config from command 'sudo sshd -f /dev/null -T'"}
@@ -718,7 +729,6 @@ set result [check_file $params(f)]
 if {$check_errors} {
 	putx "NOTE: There were errors during processing. Please check your configuration file for syntax errors."
 }
-# putx "[c yellow]test[c default]"
 
 if {!$params(noout)} {
 	puts "\n## RESULTS ##\n"

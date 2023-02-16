@@ -1,8 +1,8 @@
-#!/bin/bash
+#!/bin/sh
 ##
-## OpenSSHd Security Config Checker $sshdcc_version"
+## OpenSSHd Security Config Checker
 ##
-## Copyright 2018 SektionEins GmbH
+## Copyright 2018-2023 SektionEins GmbH
 ## 
 ## Licensed under the Apache License, Version 2.0 (the "License");
 ## you may not use this file except in compliance with the License.
@@ -28,14 +28,35 @@ for i in tclsh8.6 tclsh; do \
 	if type $i >/dev/null; then exec $i "$0" "$@"; fi; \
 done; echo "Tcl not found. Please install Tcl 8.6 or newer"; exit 1
 
+set tool_name sshdcc
+set tool_version "0.2.1dev1"
+set tool_url "https://github.com/sektioneins/$tool_name"
+set tool_copyright "(c) 2018-2023 SektionEins GmbH / Ben Fuhrmannek - https://sektioneins.de/"
+set tool_banner "OpenSSHd Security Config Checker v$tool_version"
+append tool_banner "\n  $tool_copyright\n  $tool_url"
 
-if {[catch {package require Tcl 8.6} err]} { puts stderr $err; exit 1}
-package require cmdline
-package require fileutil
-package require textutil
+proc load_scframework {} {
+	foreach dir [list [file dirname [info script]] /usr/local/lib/$::tool_name /usr/lib/$::tool_name /usr/share/$::tool_name] {
+		set fn [file join $dir {scframework/scframework.tcl}]
+		if {[file exists $fn]} {
+			source $fn
+			namespace import scframework::*
+			set ::tool_libdir $dir
+			return
+		}
+	}
+	puts stderr "Cannot find scframework."
+	exit 1
+}
+load_scframework
+init_scframework {}
 
-set sshdcc_version "0.2"
-set isatty [dict exists [fconfigure stdout] -mode]
+
+# set sshdcc_version "0.2.1dev1"
+# set isatty [dict exists [fconfigure stdout] -mode]
+
+# source {../openvpn-config-checker/scframework/scframework.tcl}
+# namespace import scframework::*
 
 ##
 
@@ -52,37 +73,6 @@ set defaults {}
 
 ##
 
-## wrappers for lsearch
-proc in_list {list pattern args} {
-	return [expr {[lsearch {*}$args $list $pattern] >= 0}]
-}
-proc in_list_any {list patternlist args} {
-	foreach pattern patternlist {
-		if {[lsearch {*}$args $list $pattern] >= 0} {
-			return 1
-		}
-	}
-}
-
-## read file or exit
-proc read_file {fn} {
-	if {![file readable $fn]} {
-		puts stderr "file $fn does not exist or is not readable"
-		exit 1
-	}
-	return [::fileutil::cat $fn]
-}
-
-## read data from command or exit
-proc read_cmd {cmd} {
-	try {
-		set f [open "|$cmd"]
-	}
-	set data [read $f]
-	catch {close $f}
-	return $data
-}
-
 ## read file and parse config
 proc load_config {fn} {
 	return [parse_config [read_file $fn] $fn]
@@ -90,9 +80,7 @@ proc load_config {fn} {
 
 ## parse config from data and return a list of dicts for each relevant line
 proc parse_config {data {cfgfn ""}} {
-	# global defaults
 	set result {}
-	# set ::check_errors 0
 	set lines [split $data "\n"]
 	set lineno 0
 	foreach line $lines {
@@ -123,25 +111,13 @@ proc parse_config {data {cfgfn ""}} {
 	return $result
 }
 
-## split by word
-proc wsplit {str} {
-	return [regexp -inline -all -- {[^\s]+} $str]
-}
-
 ## add to result list - internal function to be used within check_file
 proc addresult {severity msg desc} {
-	upvar lineno lineno
+	upvar entry entry
 	upvar result result
-	upvar line line key key value value
-	lappend result [list severity $severity msg $msg desc $desc key $key value $value line $line lineno $lineno]
+	lappend result [list severity $severity msg $msg desc $desc {*}$entry]
 }
 
-## parse /etc/group or /etc/passwd and return list of groups/usernames
-proc get_groups {fn} {
-	return [lmap u [regexp -all -inline -line -- {^.*?:} [fileutil::cat $fn]] {
-		string trimright $u {:}
-	}]
-}
 
 ## map alias options to their counterpart by changing the 'key'
 proc map_aliases {cfgdata} {
@@ -249,18 +225,11 @@ proc check_file {fn} {
 					} elseif {![file executable $value]} {
 						addresult notice "$key is not executable" {This will never work.}
 					} else {
-						file stat $value stat
-						if {[expr {$stat(mode) & 0022}]} {
+						if {[file_mode $value] & 0022} {
 							addresult warning "$key is writable by group or others" {Please change file permissions immediately.}
 						}
-
-						set path_components [file split $value]
-						for {set i 0} {$i < [llength $path_components]-1} {incr i} {
-							set dir [file join {*}[lrange $path_components 0 $i]]
-							file stat $dir stat
-							if {[expr {$stat(mode) & 0022}]} {
-								addresult warning "parent directory is writable by group or others: $dir" {Please change file permissions if necessary.}
-							}
+						if {[check_parent_dir_mode $value 0022]} {
+							addresult warning "parent directory is writable by group or others" {Please change file permissions if necessary.}
 						}
 					}
 				}
@@ -598,8 +567,7 @@ proc check_file {fn} {
 
 	if {!$::params(ns)} {
 		## check /etc/ssh/sshd_config owner/permissions
-		file stat $::params(f) stat
-		if {[expr {$stat(mode) & 0022}]} {
+		if {[file_mode $::params(f)] & 0022} {
 			addresult warning "$::params(f) is writable by group or others" {Please change file permissions immediately.}
 		}
 	}
@@ -608,30 +576,17 @@ proc check_file {fn} {
 	return $result
 }
 
-## restrict line length for easier readability and email-compatible copy/paste
-proc putx {str {indent 0}} {
-	set width 79
-	set str [::textutil::adjust $str -justify left -length [expr {$width - $indent}]]
-	if {$indent} {
-		set str [::textutil::indent $str [string repeat " " $indent]]
-	}
-	puts $str
-}
-
-## return current date and time
-proc timestamp {} {
-	return [clock format [clock seconds] -format "%Y-%m-%d %H:%M:%S"]
-}
 
 ## CLI
 
-puts "------------------------------------------------------------------------------"
-puts "This is OpenSSHd Security Config Checker $sshdcc_version"
-puts "  - (c) 2018-2023 SektionEins GmbH / Ben Fuhrmannek - https://sektioneins.de/"
-puts "  - download -> https://github.com/sektioneins/sshdcc"
-puts "running on $tcl_platform(os) $tcl_platform(osVersion) $tcl_platform(machine) with Tcl $tcl_version [expr {$isatty ? "with" : "without"}] TTY"
-puts "started at [timestamp]"
-puts "------------------------------------------------------------------------------"
+print_banner
+# puts "------------------------------------------------------------------------------"
+# puts "This is the OpenSSHd Security Config Checker v$sshdcc_version"
+# puts "  (c) 2018-2023 SektionEins GmbH / Ben Fuhrmannek - https://sektioneins.de/"
+# puts "  https://github.com/sektioneins/sshdcc"
+# puts "running on $tcl_platform(os) $tcl_platform(osVersion) $tcl_platform(machine) with Tcl $tcl_version [expr {$isatty ? "with" : "without"}] TTY"
+# puts "started at [timestamp]"
+# puts "------------------------------------------------------------------------------"
 
 set options {
 	{f.arg "/etc/ssh/sshd_config" "scan file"}
@@ -660,49 +615,11 @@ try {
 	exit 1
 }
 
-## init color
-if {!$params(nc) && $isatty} {
-	package require term::ansi::code
-	package require term::ansi::code::ctrl
-
-}
-proc c {name} {
-	if {$::params(nc)} { return "" }
-	switch -exact $name {
-		critical { set name "magenta" }
-		warning { set name "red" }
-		notice { set name "yellow" }
-		info { set name "green" }
-	}
-	# return "{$name}"
-	foreach prefix {"::term::ansi::code::ctrl::sda_fg" "::term::ansi::code::ctrl::sda_" "::term::ansi::code::ctrl::"} {
-		set cmd "$prefix$name"
-		if {[info commands $cmd] ne ""} { return [$cmd] }
-	}
-	# return "{none}"
-	return ""
-}
-
-## CSV checks
-if {$params(csv) ne ""} {
-	package require csv
-
-	if {[file exists $params(csv)]} {
-		puts stderr "CSV file '$params(csv)' already exists."
-		exit 1
-	}
-	if {![file writable [file dirname $params(csv)]]} {
-		puts stderr "Directory not writable: $params(csv)"
-		exit 1
-	}
-}
+init_color_output
 
 ## info
 
 puts "additional live system checks are [expr {$params(ns) ? {disabled} : {enabled}}]"
-if {$params(csv) ne ""} {
-	puts "writing results to $params(csv)"
-}
 
 ## defaults
 
@@ -734,50 +651,30 @@ if {!$params(noout)} {
 	puts "\n## RESULTS ##\n"
 	if {[llength $result] == 0} {
 		putx "There are no findings regarding your configuration file, not even comments. This is highly unusual."
-		exit 0
-	}
-
-	set resultno 0
-	foreach severity {critical warning notice info} {
-		foreach entry [lsearch -all -inline -index 1 -exact $result $severity] {
-			foreach k {msg desc key value line lineno} {
-				set $k [dict get $entry $k]
-			}
-			# 
-			incr resultno
-			puts "[c bold]($resultno)[c reset] \[[c $severity][string toupper $severity][c default]\] [c bold]$msg[c reset]"
-			if {$lineno > 0} {
-				putx "[c italic]#> LINE $lineno: $line[c reset]" 4
-			} else {
-				putx "[c italic]#> SYSTEM DEFAULT: $line[c reset]" 4
-			}
-			putx $desc 4
-			puts ""
-
-			if {$params(csv) ne ""} {
+	} else {
+		set resultno 0
+		foreach severity {critical warning notice info} {
+			foreach entry [lsearch -all -inline -index 1 -exact $result $severity] {
+				foreach k {msg desc key value cfgfn line lineno} {
+					set $k [dict get $entry $k]
+				}
+				#
+				incr resultno
+				puts "[c bold]($resultno)[c reset] \[[c $severity][string toupper $severity][c default]\] [c bold]$msg[c reset]"
+				if {$lineno > 0} {
+					putx "[c italic]#> $cfgfn LINE $lineno: $line[c reset]" 4
+				} else {
+					putx "[c italic]#> SYSTEM DEFAULT: $line[c reset]" 4
+				}
+				putx $desc 4
+				puts ""
 			}
 		}
 	}
 }
 
 ## CSV output
-if {$params(csv) ne ""} {
-	set csv [open $params(csv) wb]
-	set csv_keys {resultno msg desc key value lineno line}
-	set csv_header {"No." "Short description" "Description" "Option" "Value" "Line no." "Line"}
-	puts $csv [csv::join $csv_header]
-
-	set resultno 0
-	foreach severity {critical warning notice info} {
-		foreach entry [lsearch -all -inline -index 1 -exact $result $severity] {
-			foreach k {msg desc key value line lineno} {
-				set $k [dict get $entry $k]
-			}
-			incr resultno
-			puts $csv [csv::join [lmap k $csv_keys {set $k}]]
-		}
-	}
-	close $csv
-}
+csv_output $params(csv) $result
 
 puts "done."
+if {$check_errors} { exit 1 }
